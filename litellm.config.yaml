@@ -1,0 +1,21 @@
+# LiteLLM proxy: translates Anthropic /v1/messages -> Ollama.
+# Reached only for ollama model names (router forwards them here). No auth.
+model_list:
+  - model_name: deepseek-coder:6.7b
+    litellm_params:
+      model: ollama_chat/deepseek-coder:6.7b
+      api_base: http://192.168.0.26:11434
+  - model_name: qwen2.5-coder:7b
+    litellm_params:
+      model: ollama_chat/qwen2.5-coder:7b
+      api_base: http://192.168.0.26:11434
+  - model_name: llama3.1:8b
+    litellm_params:
+      model: ollama_chat/llama3.1:8b
+      api_base: http://192.168.0.26:11434
+
+litellm_settings:
+  drop_params: true
+
+general_settings:
+  # No master_key => proxy accepts requests without client auth.

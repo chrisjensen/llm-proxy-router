@@ -1,0 +1,10 @@
+{
+  "name": "llm-proxy-router",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Model-based router: glm-* -> z.ai (keyed), else -> api.anthropic.com verbatim. Runs behind headroom.",
+  "bin": { "llm-proxy-router": "router.mjs" },
+  "scripts": { "start": "node router.mjs" },
+  "engines": { "node": ">=18" }
+}
