@@ -76,6 +76,42 @@ function pickRoute(model) {
   return routes.find((r) => r.match.test(m)) ?? routes[routes.length - 1];
 }
 
+// z.ai-session remap. Claude Code (skills, internal haiku calls) emits claude-*
+// models; a z.ai-authed session can't use them against Anthropic. When the
+// session sends ZAI_SESSION_HEADER, rewrite claude-* to a z.ai model so the
+// request routes to the zai upstream. Non-claude models pass through unchanged.
+const ZAI_SESSION_HEADER = "x-zai-session";
+const ZAI_MODEL_DEFAULT = process.env.ZAI_MODEL_DEFAULT ?? "glm-4.6";
+const ZAI_MODEL_LIGHT = process.env.ZAI_MODEL_LIGHT ?? "glm-4.5-air";
+
+function remapZaiModel(model) {
+  if (typeof model !== "string" || !/^claude/i.test(model)) return null;
+  return /haiku/i.test(model) ? ZAI_MODEL_LIGHT : ZAI_MODEL_DEFAULT;
+}
+
+// z.ai's Anthropic-compatible endpoint rejects `tool_reference` content blocks
+// (emitted by Claude Code's advanced-tool-use / ToolSearch deferred-tool flow)
+// with `[1210] Invalid API parameter`. Replace them with equivalent text so the
+// tool_use/tool_result pairing stays intact. Returns count replaced.
+function sanitizeZaiBody(parsed) {
+  let n = 0;
+  if (!Array.isArray(parsed?.messages)) return n;
+  for (const m of parsed.messages) {
+    if (!Array.isArray(m.content)) continue;
+    for (const blk of m.content) {
+      if (blk?.type !== "tool_result" || !Array.isArray(blk.content)) continue;
+      blk.content = blk.content.map((x) => {
+        if (x?.type === "tool_reference") {
+          n++;
+          return { type: "text", text: `[tool loaded: ${x.tool_name ?? "?"}]` };
+        }
+        return x;
+      });
+    }
+  }
+  return n;
+}
+
 // Hop-by-hop headers must not be forwarded.
 const HOP = new Set([
   "connection",
@@ -98,16 +134,37 @@ const server = http.createServer((req, res) => {
   const chunks = [];
   req.on("data", (c) => chunks.push(c));
   req.on("end", () => {
-    const body = Buffer.concat(chunks);
+    let body = Buffer.concat(chunks);
 
-    let model;
+    let model, parsed;
     try {
-      model = JSON.parse(body.toString("utf8")).model;
+      parsed = JSON.parse(body.toString("utf8"));
+      model = parsed.model;
     } catch {
       // non-JSON / no body -> falls through to catch-all route
     }
 
+    // z.ai session: rewrite claude-* model in body so it routes to zai upstream.
+    if (parsed && req.headers[ZAI_SESSION_HEADER] !== undefined) {
+      const remapped = remapZaiModel(model);
+      if (remapped) {
+        parsed.model = remapped;
+        model = remapped;
+        body = Buffer.from(JSON.stringify(parsed), "utf8");
+      }
+    }
+
     const route = pickRoute(model);
+
+    // z.ai rejects tool_reference blocks; rewrite them before forwarding.
+    if (route.name === "zai" && parsed) {
+      const n = sanitizeZaiBody(parsed);
+      if (n) {
+        body = Buffer.from(JSON.stringify(parsed), "utf8");
+        console.error(`router: sanitized ${n} tool_reference block(s) for zai`);
+      }
+    }
+
     const target = new URL(route.url);
     const isHttps = target.protocol === "https:";
 
@@ -118,6 +175,7 @@ const server = http.createServer((req, res) => {
       headers[k] = v;
     }
     headers["host"] = target.host;
+    delete headers[ZAI_SESSION_HEADER];
     if (body.length) headers["content-length"] = String(body.length);
 
     switch (route.auth) {
@@ -153,8 +211,42 @@ const server = http.createServer((req, res) => {
     const proxyReq = client.request(
       { host: target.hostname, port, method: req.method, path: upstreamPath, headers },
       (proxyRes) => {
-        res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers);
-        proxyRes.pipe(res);
+        const status = proxyRes.statusCode ?? 502;
+        res.writeHead(status, proxyRes.headers);
+        // Capture failing upstream responses for diagnosis (req body + resp body).
+        if (status >= 400) {
+          const respChunks = [];
+          proxyRes.on("data", (c) => {
+            respChunks.push(c);
+            res.write(c);
+          });
+          proxyRes.on("end", () => {
+            res.end();
+            try {
+              const safeHeaders = { ...headers };
+              delete safeHeaders["authorization"];
+              delete safeHeaders["x-api-key"];
+              const dump = {
+                ts: new Date().toISOString(),
+                route: route.name,
+                url: route.url,
+                model,
+                status,
+                requestHeaders: safeHeaders,
+                requestBody: body.toString("utf8"),
+                responseBody: Buffer.concat(respChunks).toString("utf8"),
+              };
+              const dir = expandHome("~/.headroom/logs");
+              const file = path.join(dir, `router-fail-${Date.now()}.json`);
+              fs.writeFileSync(file, JSON.stringify(dump, null, 2));
+              console.error(`router: captured ${status} from ${route.name} -> ${file}`);
+            } catch (e) {
+              console.error(`router: failed to write fail dump: ${e}`);
+            }
+          });
+        } else {
+          proxyRes.pipe(res);
+        }
       },
     );
 
