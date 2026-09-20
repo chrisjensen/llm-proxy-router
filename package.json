@@ -5,6 +5,10 @@
   "type": "module",
   "description": "Model-based router: glm-* -> z.ai (keyed), else -> api.anthropic.com verbatim. Runs behind headroom.",
   "bin": { "llm-proxy-router": "router.mjs" },
-  "scripts": { "start": "node router.mjs" },
+  "scripts": {
+    "start": "node router.mjs",
+    "restart": "systemctl --user restart model-router.service",
+    "update": "git pull && npm run restart"
+  },
   "engines": { "node": ">=18" }
 }
