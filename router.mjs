@@ -141,6 +141,43 @@ function sanitizeZaiBody(parsed) {
   return n;
 }
 
+// Kimi's Anthropic-compatible endpoint rejects `tool_addition` / `tool_removal`
+// content blocks (Claude Code's mid-conversation-tool-changes flow) with a bare
+// 400 "Invalid request Error". Remove them from messages: inline tool
+// definitions in tool_addition are hoisted into top-level `tools` (if not
+// already there); tool_reference additions are dropped (their target is already
+// defined in `tools`); tool_removal drops the named tool from `tools`.
+// Returns count of blocks removed.
+function stripToolChanges(parsed) {
+  if (!Array.isArray(parsed?.messages)) return 0;
+  const tools = parsed.tools ?? (parsed.tools = []);
+  let n = 0;
+  for (const m of parsed.messages) {
+    if (!Array.isArray(m.content)) continue;
+    const kept = [];
+    for (const blk of m.content) {
+      if (blk?.type === "tool_addition") {
+        n++;
+        const tool = blk.tool;
+        if (
+          tool && typeof tool === "object" && tool.type !== "tool_reference" &&
+          tool.name && !tools.some((t) => t.name === tool.name)
+        ) {
+          tools.push(tool);
+        }
+      } else if (blk?.type === "tool_removal" && blk.tool?.name) {
+        n++;
+        const idx = tools.findIndex((t) => t.name === blk.tool.name);
+        if (idx !== -1) tools.splice(idx, 1);
+      } else {
+        kept.push(blk);
+      }
+    }
+    m.content = kept;
+  }
+  return n;
+}
+
 // Recursively delete every `pattern` key from a JSON-Schema object. Returns count removed.
 function stripSchemaPatterns(node) {
   let n = 0;
@@ -211,6 +248,15 @@ const server = http.createServer((req, res) => {
       if (n) {
         body = Buffer.from(JSON.stringify(parsed), "utf8");
         console.error(`router: sanitized ${n} block(s)/pattern(s) for zai`);
+      }
+    }
+
+    // kimi rejects tool_addition/tool_removal blocks; fix before forwarding.
+    if (route.name === "kimi" && parsed) {
+      const n = stripToolChanges(parsed);
+      if (n) {
+        body = Buffer.from(JSON.stringify(parsed), "utf8");
+        console.error(`router: stripped ${n} tool_addition/tool_removal block(s) for kimi`);
       }
     }
 
