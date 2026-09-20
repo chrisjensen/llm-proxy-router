@@ -24,10 +24,13 @@ const ROUTES_FILE = expandHome(
     path.join(os.homedir(), ".config/headroom-router/routes.mjs"),
 );
 
-// Load routing table. Fail loud — a router with no routes is useless.
+// Load routing table + force-remap profiles. Fail loud on routes — a router with
+// no routes is useless. forceProfiles is optional (warn, don't crash): its absence
+// just disables the X-LLM-Force header.
 let routes;
+let forceProfiles;
 try {
-  ({ routes } = await import(pathToFileURL(ROUTES_FILE).href));
+  ({ routes, forceProfiles } = await import(pathToFileURL(ROUTES_FILE).href));
 } catch (err) {
   console.error(`router: failed to load ROUTES_FILE ${ROUTES_FILE}: ${err}`);
   process.exit(1);
@@ -35,6 +38,10 @@ try {
 if (!Array.isArray(routes) || routes.length === 0) {
   console.error(`router: ROUTES_FILE ${ROUTES_FILE} has no non-empty 'routes' array`);
   process.exit(1);
+}
+if (!forceProfiles || typeof forceProfiles !== "object") {
+  console.warn(`router: ROUTES_FILE ${ROUTES_FILE} has no 'forceProfiles' — X-LLM-Force disabled`);
+  forceProfiles = {};
 }
 
 // Normalize match to a RegExp.
@@ -76,17 +83,31 @@ function pickRoute(model) {
   return routes.find((r) => r.match.test(m)) ?? routes[routes.length - 1];
 }
 
-// z.ai-session remap. Claude Code (skills, internal haiku calls) emits claude-*
-// models; a z.ai-authed session can't use them against Anthropic. When the
-// session sends ZAI_SESSION_HEADER, rewrite claude-* to a z.ai model so the
-// request routes to the zai upstream. Non-claude models pass through unchanged.
-const ZAI_SESSION_HEADER = "x-zai-session";
-const ZAI_MODEL_DEFAULT = process.env.ZAI_MODEL_DEFAULT ?? "glm-4.6";
-const ZAI_MODEL_LIGHT = process.env.ZAI_MODEL_LIGHT ?? "glm-4.5-air";
+// Force-remap. Claude Code (skills, subagents, internal calls) emits literal
+// claude-* model names; a session authed against a non-Anthropic upstream can't
+// route those to Anthropic. When the session sends FORCE_HEADER: <profile>, rewrite
+// each claude-* model to that profile's provider model (see forceProfiles in
+// routes.mjs) so it routes to the right upstream. Non-claude models pass through.
+const FORCE_HEADER = "x-llm-force";
 
-function remapZaiModel(model) {
+// Classify a claude-* model name into a profile key. Non-claude -> null.
+function classifyClaude(model) {
   if (typeof model !== "string" || !/^claude/i.test(model)) return null;
-  return /haiku/i.test(model) ? ZAI_MODEL_LIGHT : ZAI_MODEL_DEFAULT;
+  if (/haiku/i.test(model)) return "haiku";
+  if (/sonnet/i.test(model)) return "sonnet";
+  if (/opus/i.test(model)) return "opus";
+  if (/fable/i.test(model)) return "fable";
+  return "default";
+}
+
+// Resolve the forced target model for a claude-* model under a named profile.
+// Returns null when the model isn't claude-* or the profile is unknown.
+function remapForcedModel(model, profileName) {
+  const cls = classifyClaude(model);
+  if (cls === null) return null;
+  const profile = forceProfiles[profileName];
+  if (!profile) return null;
+  return profile[cls] ?? profile.default ?? null;
 }
 
 // z.ai's Anthropic-compatible endpoint rejects `tool_reference` content blocks
@@ -144,9 +165,14 @@ const server = http.createServer((req, res) => {
       // non-JSON / no body -> falls through to catch-all route
     }
 
-    // z.ai session: rewrite claude-* model in body so it routes to zai upstream.
-    if (parsed && req.headers[ZAI_SESSION_HEADER] !== undefined) {
-      const remapped = remapZaiModel(model);
+    // Force-remap: rewrite a leaked claude-* model in the body to the header
+    // profile's provider model so it routes to the right upstream.
+    if (parsed && req.headers[FORCE_HEADER] !== undefined) {
+      const profileName = String(req.headers[FORCE_HEADER]);
+      if (!forceProfiles[profileName]) {
+        console.warn(`router: X-LLM-Force '${profileName}' is not a known profile — model unchanged`);
+      }
+      const remapped = remapForcedModel(model, profileName);
       if (remapped) {
         parsed.model = remapped;
         model = remapped;
@@ -175,7 +201,7 @@ const server = http.createServer((req, res) => {
       headers[k] = v;
     }
     headers["host"] = target.host;
-    delete headers[ZAI_SESSION_HEADER];
+    delete headers[FORCE_HEADER];
     if (body.length) headers["content-length"] = String(body.length);
 
     switch (route.auth) {
