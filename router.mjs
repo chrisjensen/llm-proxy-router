@@ -110,25 +110,48 @@ function remapForcedModel(model, profileName) {
   return profile[cls] ?? profile.default ?? null;
 }
 
-// z.ai's Anthropic-compatible endpoint rejects `tool_reference` content blocks
-// (emitted by Claude Code's advanced-tool-use / ToolSearch deferred-tool flow)
-// with `[1210] Invalid API parameter`. Replace them with equivalent text so the
-// tool_use/tool_result pairing stays intact. Returns count replaced.
+// z.ai's Anthropic-compatible endpoint rejects two things Claude Code emits, each
+// with `[1210] Invalid API parameter`:
+//   1. `tool_reference` content blocks (advanced-tool-use / ToolSearch deferred-tool
+//      flow) — replaced with equivalent text so tool_use/tool_result pairing stays intact.
+//   2. tool `input_schema` regex `pattern`s using PCRE features (negative lookahead,
+//      `\p{…}`, etc.) that z.ai's Go/RE2 validator can't compile — e.g. the Artifact tool.
+//      `pattern` is advisory client-side arg validation z.ai doesn't honor, so we drop it.
+// Returns count of changes made.
 function sanitizeZaiBody(parsed) {
   let n = 0;
-  if (!Array.isArray(parsed?.messages)) return n;
-  for (const m of parsed.messages) {
-    if (!Array.isArray(m.content)) continue;
-    for (const blk of m.content) {
-      if (blk?.type !== "tool_result" || !Array.isArray(blk.content)) continue;
-      blk.content = blk.content.map((x) => {
-        if (x?.type === "tool_reference") {
-          n++;
-          return { type: "text", text: `[tool loaded: ${x.tool_name ?? "?"}]` };
-        }
-        return x;
-      });
+  if (Array.isArray(parsed?.messages)) {
+    for (const m of parsed.messages) {
+      if (!Array.isArray(m.content)) continue;
+      for (const blk of m.content) {
+        if (blk?.type !== "tool_result" || !Array.isArray(blk.content)) continue;
+        blk.content = blk.content.map((x) => {
+          if (x?.type === "tool_reference") {
+            n++;
+            return { type: "text", text: `[tool loaded: ${x.tool_name ?? "?"}]` };
+          }
+          return x;
+        });
+      }
     }
+  }
+  if (Array.isArray(parsed?.tools)) {
+    for (const tool of parsed.tools) n += stripSchemaPatterns(tool?.input_schema);
+  }
+  return n;
+}
+
+// Recursively delete every `pattern` key from a JSON-Schema object. Returns count removed.
+function stripSchemaPatterns(node) {
+  let n = 0;
+  if (Array.isArray(node)) {
+    for (const item of node) n += stripSchemaPatterns(item);
+  } else if (node && typeof node === "object") {
+    if ("pattern" in node) {
+      delete node.pattern;
+      n++;
+    }
+    for (const value of Object.values(node)) n += stripSchemaPatterns(value);
   }
   return n;
 }
@@ -182,12 +205,12 @@ const server = http.createServer((req, res) => {
 
     const route = pickRoute(model);
 
-    // z.ai rejects tool_reference blocks; rewrite them before forwarding.
+    // z.ai rejects tool_reference blocks and unsupported schema patterns; fix before forwarding.
     if (route.name === "zai" && parsed) {
       const n = sanitizeZaiBody(parsed);
       if (n) {
         body = Buffer.from(JSON.stringify(parsed), "utf8");
-        console.error(`router: sanitized ${n} tool_reference block(s) for zai`);
+        console.error(`router: sanitized ${n} block(s)/pattern(s) for zai`);
       }
     }
 
