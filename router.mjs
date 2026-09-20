@@ -193,6 +193,38 @@ function stripSchemaPatterns(node) {
   return n;
 }
 
+// synthetic.new dispatches each hf: model to its own inference backend. The
+// Qwen backend enforces OpenAI ordering and rejects any system-role message
+// that is not messages[0] with `400 System message must be at the beginning`.
+// Claude Code's SessionStart hooks inject their output as system-role messages
+// appended to `messages`, tripping this. Hoist every in-array system message
+// into the Anthropic top-level `system` field (where it belongs) and drop it
+// from `messages`. Returns count hoisted.
+function hoistSystemMessages(parsed) {
+  if (!Array.isArray(parsed?.messages)) return 0;
+
+  // Normalize a message's content to an array of Anthropic content blocks.
+  const toBlocks = (content) => {
+    if (typeof content === "string") return [{ type: "text", text: content }];
+    if (Array.isArray(content)) return content;
+    return [];
+  };
+
+  const hoisted = [];
+  parsed.messages = parsed.messages.filter((m) => {
+    if (m?.role !== "system") return true;
+    hoisted.push(...toBlocks(m.content));
+    return false;
+  });
+  if (hoisted.length === 0) return 0;
+
+  // Merge into top-level system, normalizing it to a block array first.
+  const existing =
+    parsed.system == null ? [] : toBlocks(parsed.system);
+  parsed.system = [...existing, ...hoisted];
+  return hoisted.length;
+}
+
 // Hop-by-hop headers must not be forwarded.
 const HOP = new Set([
   "connection",
@@ -257,6 +289,16 @@ const server = http.createServer((req, res) => {
       if (n) {
         body = Buffer.from(JSON.stringify(parsed), "utf8");
         console.error(`router: stripped ${n} tool_addition/tool_removal block(s) for kimi`);
+      }
+    }
+
+    // synthetic's Qwen backend rejects system-role messages not at the start;
+    // hoist any into the top-level `system` field before forwarding.
+    if (route.name === "synthetic" && parsed) {
+      const n = hoistSystemMessages(parsed);
+      if (n) {
+        body = Buffer.from(JSON.stringify(parsed), "utf8");
+        console.error(`router: hoisted ${n} in-array system message(s) for synthetic`);
       }
     }
 
