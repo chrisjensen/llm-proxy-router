@@ -346,7 +346,11 @@ const server = http.createServer((req, res) => {
     const port = target.port || (isHttps ? 443 : 80);
 
     const proxyReq = client.request(
-      { host: target.hostname, port, method: req.method, path: upstreamPath, headers },
+      // family: 4 — this host has no IPv6 route; upstreams (e.g. api.z.ai) publish
+      // AAAA records that ENETUNREACH. Node's Happy-Eyeballs (autoSelectFamily,
+      // default on) races both families and intermittently surfaces the dead
+      // IPv6 leg as `AggregateError: ETIMEDOUT` instead of falling back to IPv4.
+      { host: target.hostname, port, method: req.method, path: upstreamPath, headers, family: 4 },
       (proxyRes) => {
         const status = proxyRes.statusCode ?? 502;
         res.writeHead(status, proxyRes.headers);
@@ -388,6 +392,7 @@ const server = http.createServer((req, res) => {
     );
 
     proxyReq.on("error", (err) => {
+      console.error(`router: upstream error ${route.name} -> ${route.url}: ${err}`);
       if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: "router upstream error", detail: String(err) }));
     });
